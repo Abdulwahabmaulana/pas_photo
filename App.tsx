@@ -1,11 +1,10 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { jsPDF } from 'jspdf';
-import { Upload, Plus, Trash2, Download, Printer, Info, Image as ImageIcon, Settings2, AlertTriangle, Wand2, RefreshCcw } from 'lucide-react';
+import { Upload, Plus, Trash2, Download, Printer, Info, Image as ImageIcon, Settings2, AlertTriangle, Scissors, Move, ZoomIn } from 'lucide-react';
 import { PhotoItem, PhotoSize, PageLayout, PaperSize } from './types';
 import { PHOTO_SIZES, PAPER_SIZES, PAGE_MARGIN_MM, ITEM_SPACING_MM } from './constants';
 import { calculateLayout } from './utils/layoutHelper';
 import { PhotoPreview } from './components/PhotoPreview';
-import { removeSimpleBackground } from './utils/imageProcessor';
 
 const App: React.FC = () => {
   const [photos, setPhotos] = useState<PhotoItem[]>([]);
@@ -17,14 +16,20 @@ const App: React.FC = () => {
   const [pageMargin, setPageMargin] = useState<number>(PAGE_MARGIN_MM);
   const [itemSpacing, setItemSpacing] = useState<number>(ITEM_SPACING_MM);
 
-  // Upload State
-  const [tempImage, setTempImage] = useState<{ file: File; originalUrl: string; displayUrl: string } | null>(null);
+  // Upload & Crop State
+  const [tempImage, setTempImage] = useState<{ file: File; originalUrl: string } | null>(null);
   const [selectedSize, setSelectedSize] = useState<PhotoSize>(PHOTO_SIZES[0]);
   const [quantity, setQuantity] = useState<number>(4);
   const [selectedColor, setSelectedColor] = useState<string>(''); // Empty = none
-  const [isRemovingBg, setIsRemovingBg] = useState(false);
 
+  // Crop Editor State
+  const [cropZoom, setCropZoom] = useState(1);
+  const [cropPos, setCropPos] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
 
   // Calculate layout
   const pages: PageLayout[] = useMemo(() => 
@@ -32,12 +37,11 @@ const App: React.FC = () => {
     [photos, selectedPaper, pageMargin, itemSpacing]
   );
 
-  // Simulation for warning
   const simulatedPages: PageLayout[] = useMemo(() => {
     if (!tempImage) return pages;
     const simulatedPhoto: PhotoItem = {
         id: 'temp',
-        imageUrl: tempImage.displayUrl,
+        imageUrl: tempImage.originalUrl, // Just use original for size calc
         size: selectedSize,
         quantity: quantity,
         originalFile: tempImage.file
@@ -51,39 +55,99 @@ const App: React.FC = () => {
     if (event.target.files && event.target.files[0]) {
       const file = event.target.files[0];
       const url = URL.createObjectURL(file);
-      // displayUrl is what we show and print. originalUrl is for reset.
-      setTempImage({ file, originalUrl: url, displayUrl: url });
-      setIsRemovingBg(false);
+      setTempImage({ file, originalUrl: url });
+      // Reset crop
+      setCropZoom(1);
+      setCropPos({ x: 0, y: 0 });
     }
   };
 
-  const handleRemoveBackground = async () => {
-    if (!tempImage) return;
-    setIsRemovingBg(true);
-    try {
-        // Use the CURRENT display url (so we can chain edits if needed, but usually we want from original)
-        // Actually, better to always process from original to avoid degradation
-        const newUrl = await removeSimpleBackground(tempImage.originalUrl, 45);
-        setTempImage(prev => prev ? { ...prev, displayUrl: newUrl } : null);
-    } catch (e) {
-        console.error("Bg removal failed", e);
-        alert("Gagal menghapus background.");
-    } finally {
-        setIsRemovingBg(false);
+  // --- Crop Logic ---
+  const handleMouseDown = (e: React.MouseEvent) => {
+    setIsDragging(true);
+    setDragStart({ x: e.clientX - cropPos.x, y: e.clientY - cropPos.y });
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging) return;
+    setCropPos({
+      x: e.clientX - dragStart.x,
+      y: e.clientY - dragStart.y
+    });
+  };
+
+  const handleMouseUp = () => setIsDragging(false);
+
+  const getCroppedImage = async (): Promise<string> => {
+    if (!imgRef.current) return '';
+    
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    
+    // Output resolution (high quality)
+    const scaleFactor = 10; // Higher for better print quality
+    const targetWidth = selectedSize.widthMm * scaleFactor;
+    const targetHeight = selectedSize.heightMm * scaleFactor;
+    
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+
+    if (ctx) {
+        // Clear with white or selected background
+        if (selectedColor) {
+            ctx.fillStyle = selectedColor;
+            ctx.fillRect(0, 0, targetWidth, targetHeight);
+        }
+
+        const img = imgRef.current;
+        const imgRatio = img.naturalWidth / img.naturalHeight;
+        const targetRatio = targetWidth / targetHeight;
+        
+        let drawWidth, drawHeight;
+        
+        // Calculate "Cover" dimensions
+        if (imgRatio > targetRatio) {
+            drawHeight = targetHeight;
+            drawWidth = drawHeight * imgRatio;
+        } else {
+            drawWidth = targetWidth;
+            drawHeight = drawWidth / imgRatio;
+        }
+        
+        // Apply Zoom
+        drawWidth *= cropZoom;
+        drawHeight *= cropZoom;
+        
+        // Apply Pan
+        // We need to map the visual pixel movement to the canvas resolution
+        // Visual Box Height is approx 240px. Canvas Height is targetHeight.
+        // Scale factor = targetHeight / 240.
+        const visualScale = targetHeight / 240;
+        
+        ctx.translate(targetWidth / 2, targetHeight / 2);
+        ctx.translate(cropPos.x * visualScale, cropPos.y * visualScale);
+        
+        ctx.drawImage(
+            img, 
+            -drawWidth / 2, 
+            -drawHeight / 2, 
+            drawWidth, 
+            drawHeight
+        );
     }
+    
+    return canvas.toDataURL('image/png');
   };
+  // --- End Crop Logic ---
 
-  const handleResetImage = () => {
-      if (!tempImage) return;
-      setTempImage(prev => prev ? { ...prev, displayUrl: prev.originalUrl } : null);
-  };
-
-  const addPhotoToBatch = () => {
+  const addPhotoToBatch = async () => {
     if (!tempImage) return;
+
+    const croppedUrl = await getCroppedImage();
 
     const newPhoto: PhotoItem = {
       id: Date.now().toString(),
-      imageUrl: tempImage.displayUrl,
+      imageUrl: croppedUrl,
       size: selectedSize,
       quantity: quantity,
       originalFile: tempImage.file,
@@ -93,6 +157,8 @@ const App: React.FC = () => {
     setPhotos(prev => [...prev, newPhoto]);
     
     setTempImage(null);
+    setCropZoom(1);
+    setCropPos({x:0, y:0});
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -121,47 +187,15 @@ const App: React.FC = () => {
             img.crossOrigin = "Anonymous";
             
             img.onload = () => {
-              const canvas = document.createElement('canvas');
-              const ctx = canvas.getContext('2d');
-              
-              const scale = 10; 
-              const w = item.width * scale;
-              const h = item.height * scale;
-              
-              canvas.width = w;
-              canvas.height = h;
-              
-              if (ctx) {
-                 // 1. Fill background
-                 if (item.backgroundColor) {
-                   ctx.fillStyle = item.backgroundColor;
-                   ctx.fillRect(0, 0, w, h);
-                 }
-                 
-                 // 2. Calculate Center Crop (Object-Fit: Cover)
-                 const imgRatio = img.width / img.height;
-                 const targetRatio = item.width / item.height;
-                 
-                 let drawW, drawH, offsetX, offsetY;
-                 
-                 if (imgRatio > targetRatio) {
-                    drawH = h;
-                    drawW = h * imgRatio;
-                    offsetX = (w - drawW) / 2;
-                    offsetY = 0;
-                 } else {
-                    drawW = w;
-                    drawH = w / imgRatio;
-                    offsetX = 0;
-                    offsetY = (h - drawH) / 2;
-                 }
-                 
-                 ctx.drawImage(img, offsetX, offsetY, drawW, drawH);
-                 
-                 const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
-                 doc.addImage(dataUrl, 'JPEG', item.x, item.y, item.width, item.height);
+              // If background color exists, draw rect first
+              if (item.backgroundColor) {
+                doc.setFillColor(item.backgroundColor);
+                doc.rect(item.x, item.y, item.width, item.height, 'F');
               }
 
+              doc.addImage(img, 'PNG', item.x, item.y, item.width, item.height);
+              
+              // Border line
               doc.setDrawColor(200, 200, 200);
               doc.setLineWidth(0.1);
               doc.rect(item.x, item.y, item.width, item.height);
@@ -187,16 +221,16 @@ const App: React.FC = () => {
   useEffect(() => {
     return () => {
       photos.forEach(p => URL.revokeObjectURL(p.imageUrl));
-      if (tempImage) {
-        URL.revokeObjectURL(tempImage.originalUrl);
-        if (tempImage.displayUrl !== tempImage.originalUrl) {
-            URL.revokeObjectURL(tempImage.displayUrl);
-        }
-      }
+      if (tempImage) URL.revokeObjectURL(tempImage.originalUrl);
     };
   }, []);
 
   const totalItems = pages.reduce((acc, page) => acc + page.items.length, 0);
+
+  // Calculate preview box style for the cropper
+  const previewAspectRatio = selectedSize.widthMm / selectedSize.heightMm;
+  const PREVIEW_HEIGHT = 240;
+  const previewWidth = PREVIEW_HEIGHT * previewAspectRatio;
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -288,12 +322,12 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Upload / Settings Card */}
+          {/* Upload / Edit Card */}
           <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
             <div className="p-5 border-b border-gray-100 bg-gray-50">
               <h2 className="font-semibold text-gray-900 flex items-center gap-2">
-                <Upload size={18} className="text-blue-600" />
-                {tempImage ? 'Pengaturan Foto' : 'Tambah Foto Baru'}
+                {tempImage ? <Scissors size={18} className="text-blue-600" /> : <Upload size={18} className="text-blue-600" />}
+                {tempImage ? 'Edit & Potong Foto' : 'Tambah Foto Baru'}
               </h2>
             </div>
             
@@ -312,56 +346,52 @@ const App: React.FC = () => {
               ) : (
                 <div className="space-y-5">
                   
-                  {/* Preview + BG Tools */}
-                  <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
-                    <div className="flex justify-center relative overflow-hidden mb-3">
-                        {/* Background Checkboard */}
-                        <div className="absolute inset-0 opacity-10 bg-[linear-gradient(45deg,#808080_25%,transparent_25%,transparent_75%,#808080_75%,#808080),linear-gradient(45deg,#808080_25%,transparent_25%,transparent_75%,#808080_75%,#808080)] bg-[size:20px_20px] bg-[position:0_0,10px_10px]"></div>
-
-                        <div 
-                            className="relative shadow-md overflow-hidden transition-colors duration-300"
-                            style={{ 
-                                width: `${selectedSize.widthMm * 3}px`, 
-                                height: `${selectedSize.heightMm * 3}px`,
-                                backgroundColor: selectedColor || 'transparent'
+                  {/* Crop Area */}
+                  <div className="flex flex-col items-center bg-gray-100 rounded-lg p-4 border border-gray-200">
+                    <div 
+                        className="relative overflow-hidden bg-white shadow-sm cursor-move select-none"
+                        style={{ 
+                            width: `${previewWidth}px`, 
+                            height: `${PREVIEW_HEIGHT}px`,
+                            backgroundColor: selectedColor || '#f3f4f6'
+                        }}
+                        onMouseDown={handleMouseDown}
+                        onMouseMove={handleMouseMove}
+                        onMouseUp={handleMouseUp}
+                        onMouseLeave={handleMouseUp}
+                    >
+                        <img 
+                            ref={imgRef}
+                            src={tempImage.originalUrl} 
+                            className="max-w-none absolute origin-center"
+                            style={{
+                                left: '50%',
+                                top: '50%',
+                                transform: `translate(-50%, -50%) translate(${cropPos.x}px, ${cropPos.y}px) scale(${cropZoom})`
                             }}
-                        >
-                            <img 
-                                src={tempImage.displayUrl} 
-                                alt="Preview" 
-                                className={`w-full h-full object-cover relative z-10 transition-opacity duration-300 ${isRemovingBg ? 'opacity-50' : 'opacity-100'}`}
-                            />
-                            {isRemovingBg && (
-                                <div className="absolute inset-0 flex items-center justify-center z-20">
-                                    <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
-                                </div>
-                            )}
+                            draggable={false}
+                            alt="Crop Preview"
+                        />
+                        {/* Overlay Grid */}
+                        <div className="absolute inset-0 border-2 border-blue-500 pointer-events-none opacity-50">
+                            <div className="w-full h-1/3 border-b border-blue-500/30"></div>
+                            <div className="w-full h-1/3 border-b border-blue-500/30 top-1/3 absolute"></div>
+                            <div className="h-full w-1/3 border-r border-blue-500/30 absolute top-0 left-0"></div>
+                            <div className="h-full w-1/3 border-r border-blue-500/30 absolute top-0 left-1/3"></div>
                         </div>
                     </div>
-
-                    {/* BG Action Buttons */}
-                    <div className="flex items-center justify-between gap-2">
-                         <button 
-                           onClick={handleRemoveBackground}
-                           disabled={isRemovingBg}
-                           className="flex-1 py-1.5 px-2 bg-white border border-gray-200 shadow-sm rounded text-xs font-medium text-gray-700 hover:bg-blue-50 hover:text-blue-700 hover:border-blue-200 transition-colors flex items-center justify-center gap-1.5"
-                           title="Otomatis menghapus warna latar belakang (misal: biru/merah) agar transparan."
-                         >
-                           <Wand2 size={12} /> Hapus Latar (Beta)
-                         </button>
-                         
-                         {tempImage.displayUrl !== tempImage.originalUrl && (
-                             <button 
-                                onClick={handleResetImage}
-                                className="py-1.5 px-2 bg-white border border-gray-200 shadow-sm rounded text-xs font-medium text-gray-500 hover:text-red-600 hover:bg-red-50 transition-colors"
-                                title="Reset ke foto asli"
-                             >
-                                <RefreshCcw size={12} />
-                             </button>
-                         )}
+                    
+                    <div className="flex items-center gap-4 mt-4 w-full max-w-[240px]">
+                        <ZoomIn size={16} className="text-gray-500" />
+                        <input 
+                            type="range" min="0.5" max="3" step="0.1"
+                            value={cropZoom}
+                            onChange={(e) => setCropZoom(parseFloat(e.target.value))}
+                            className="flex-1 h-1.5 bg-gray-300 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                        />
                     </div>
-                    <p className="text-[10px] text-gray-400 mt-2 text-center">
-                        Gunakan hapus latar jika foto Anda belum transparan.
+                    <p className="text-[10px] text-gray-400 mt-2 flex items-center gap-1">
+                        <Move size={10} /> Geser untuk mengatur posisi
                     </p>
                   </div>
 
@@ -445,8 +475,7 @@ const App: React.FC = () => {
                           </button>
                         <button
                             onClick={addPhotoToBatch}
-                            disabled={isRemovingBg}
-                            className="flex-1 py-2.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors flex items-center justify-center gap-2 disabled:bg-gray-300"
+                            className="flex-1 py-2.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors flex items-center justify-center gap-2"
                         >
                             <Plus size={16} />
                             Masukan Foto
